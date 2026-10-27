@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Моя Вебка</title>
+    <style>
+        body { margin: 0; font-family: sans-serif; background: #000; color: #fff; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+        
+        /* Заголовок */
+        .header { text-align: center; padding: 10px; font-size: 24px; font-weight: bold; text-transform: uppercase; letter-spacing: 2px; background: #111; border-bottom: 2px solid #333; }
+        
+        /* Видео зона */
+        .video-container { flex: 1; position: relative; display: flex; justify-content: center; align-items: center; background: #1a1a1a; }
+        #remoteVideo { width: 100%; height: 100%; object-fit: cover; }
+        #localVideo { position: absolute; bottom: 20px; right: 20px; width: 100px; height: 140px; object-fit: cover; border: 2px solid #fff; border-radius: 8px; background: #333; z-index: 10; }
+        
+        /* Инфо панель (пинг, страна) */
+        .info-panel { display: flex; justify-content: space-around; padding: 10px; background: #111; border-top: 2px solid #333; border-bottom: 2px solid #333; font-size: 14px; text-transform: uppercase; }
+        .info-panel span { color: #aaa; }
+        .info-panel strong { color: #fff; margin-left: 5px; }
+        
+        /* Нижняя панель кнопок */
+        .controls { display: flex; justify-content: space-around; padding: 15px; background: #111; }
+        .btn { background: #222; border: 2px solid #555; color: #fff; padding: 10px 20px; border-radius: 5px; font-size: 14px; font-weight: bold; text-transform: uppercase; cursor: pointer; transition: 0.2s; }
+        .btn:hover { background: #333; }
+        .btn.active { background: #fff; color: #000; }
+        .btn.danger { border-color: #f00; color: #f00; }
+        .btn.danger:hover { background: #f00; color: #fff; }
+    </style>
+</head>
+<body>
+    <div class="header">Моя Вебка</div>
+    
+    <div class="video-container">
+        <video id="remoteVideo" autoplay playsinline></video>
+        <video id="localVideo" autoplay muted playsinline></video>
+    </div>
+
+    <div class="info-panel">
+        <div><span>PING:</span> <strong id="pingDisplay">--</strong></div>
+        <div><span>COUNTRY:</span> <strong id="countryDisplay">--</strong></div>
+    </div>
+
+    <div class="controls">
+        <button class="btn" id="camBtn">📷 CAM</button>
+        <button class="btn" id="micBtn">🎤 MIC</button>
+        <button class="btn danger" id="stopBtn">⏹ STOP</button>
+        <button class="btn" id="nextBtn">⏭ ДАЛЕЕ</button>
+    </div>
+
+    <script>
+        let ws;
+        let pc;
+        let localStream;
+        let pingInterval;
+        const localVideo = document.getElementById('localVideo');
+        const remoteVideo = document.getElementById('remoteVideo');
+        const pingDisplay = document.getElementById('pingDisplay');
+        const countryDisplay = document.getElementById('countryDisplay');
+
+        // Функция запуска
+        async function start() {
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                localVideo.srcObject = localStream;
+                localVideo.play();
+            } catch (err) {
+                alert("Ошибка доступа к камере/микрофону: " + err.message);
+                return;
+            }
+
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+            
+            ws.onmessage = async (event) => {
+                const msg = JSON.parse(event.data);
+                
+                if (msg.type === 'init') {
+                    countryDisplay.innerText = msg.country;
+                } else if (msg.type === 'matched') {
+                    await createPeerConnection(msg.initiator);
+                } else if (msg.type === 'offer') {
+                    await pc.setRemoteDescription(new RTCSessionDescription(msg));
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    ws.send(JSON.stringify(answer));
+                } else if (msg.type === 'answer') {
+                    await pc.setRemoteDescription(new RTCSessionDescription(msg));
+                } else if (msg.type === 'candidate') {
+                    await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+                } else if (msg.type === 'pong') {
+                    const latency = Date.now() - msg.timestamp;
+                    pingDisplay.innerText = `${latency} ms`;
+                } else if (msg.type === 'partner_disconnected') {
+                    remoteVideo.srcObject = null;
+                    if (pc) pc.close();
+                }
+            };
+
+            // Пинг каждые 2 секунды
+            pingInterval = setInterval(() => {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
+                }
+            }, 2000);
+        }
+
+        async function createPeerConnection(isInitiator) {
+            if (pc) pc.close();
+            pc = new RTCPeerConnection({
+                iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+            });
+
+            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+            pc.ontrack = (event) => {
+                remoteVideo.srcObject = event.streams[0];
+            };
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    ws.send(JSON.stringify({ type: 'candidate', candidate: event.candidate }));
+                }
+            };
+
+            if (isInitiator) {
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                ws.send(JSON.stringify(offer));
+            }
+        }
+
+        // Кнопки
+        document.getElementById('camBtn').onclick = function() {
+            if (!localStream) return;
+            const track = localStream.getVideoTracks()[0];
+            track.enabled = !track.enabled;
+            this.classList.toggle('active', !track.enabled);
+        };
+
+        document.getElementById('micBtn').onclick = function() {
+            if (!localStream) return;
+            const track = localStream.getAudioTracks()[0];
+            track.enabled = !track.enabled;
+            this.classList.toggle('active', !track.enabled);
+        };
+
+        document.getElementById('stopBtn').onclick = () => {
+            if (pc) pc.close();
+            if (ws) ws.close();
+            if (localStream) localStream.getTracks().forEach(t => t.stop());
+            clearInterval(pingInterval);
+            window.location.reload(); // Сброс состояния
+        };
+
+        document.getElementById('nextBtn').onclick = () => {
+            if (ws) ws.close();
+            if (pc) pc.close();
+            setTimeout(start, 500); // Переподключение для нового поиска
+        };
+
+        // Запуск при загрузке
+        window.onload = start;
+    </script>
+</body>
+</html>
